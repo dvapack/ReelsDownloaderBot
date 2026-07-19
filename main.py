@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import html
 import logging
 import os
@@ -29,12 +30,21 @@ REELS_URL_RE = re.compile(
     re.IGNORECASE,
 )
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_MB", "49")) * 1024 * 1024
+RETRY_ATTEMPTS = int(os.getenv("RETRY_ATTEMPTS", "3"))
+RETRY_BASE_DELAY = float(os.getenv("RETRY_BASE_DELAY", "1"))
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    level=os.getenv("LOG_LEVEL", "WARNING").upper(),
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
+
+
+async def wait_before_retry(attempt: int) -> None:
+    await asyncio.sleep(RETRY_BASE_DELAY * (2 ** (attempt - 1)))
 
 
 @dataclass(frozen=True)
@@ -68,16 +78,27 @@ async def fetch_media(url: str) -> dict[str, Any]:
         "user-agent": "Mozilla/5.0 ReelsDownloaderBot/1.0",
     }
 
-    async with httpx.AsyncClient(timeout=45) as client:
-        response = await client.get(VIDEODROPPER_API_URL, headers=headers)
-        response.raise_for_status()
-        data = response.json()
+    last_error: Exception | None = None
+    for attempt in range(RETRY_ATTEMPTS):
+        try:
+            async with httpx.AsyncClient(timeout=45) as client:
+                response = await client.get(VIDEODROPPER_API_URL, headers=headers)
+                response.raise_for_status()
+                data = response.json()
 
-    if data is None or data == "link":
-        raise ValueError("API did not return downloadable media")
-    if not isinstance(data, dict):
-        raise ValueError(f"Unexpected API response: {data!r}")
-    return data
+            if data is None or data == "link":
+                raise ValueError("API did not return downloadable media")
+            if not isinstance(data, dict):
+                raise ValueError(f"Unexpected API response: {data!r}")
+            return data
+        except Exception as exc:
+            last_error = exc
+            if attempt == RETRY_ATTEMPTS - 1:
+                break
+            logger.warning("Retrying media API request after error: %s", exc)
+            await wait_before_retry(attempt + 1)
+
+    raise RuntimeError("Could not fetch media data") from last_error
 
 
 async def download_media_file(item: MediaItem, directory: Path) -> Path:
@@ -102,26 +123,44 @@ async def download_media_file(item: MediaItem, directory: Path) -> Path:
 
 
 async def download_url(url: str, path: Path) -> None:
-    downloaded = 0
     headers = {
         "referer": "https://fastvideosave.net/",
         "user-agent": "Mozilla/5.0 ReelsDownloaderBot/1.0",
     }
 
-    async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
-        async with client.stream("GET", url, headers=headers) as response:
-            response.raise_for_status()
+    last_error: Exception | None = None
+    for attempt in range(RETRY_ATTEMPTS):
+        downloaded = 0
+        path.unlink(missing_ok=True)
 
-            content_length = response.headers.get("content-length")
-            if content_length and int(content_length) > MAX_UPLOAD_BYTES:
-                raise ValueError(f"File is larger than {MAX_UPLOAD_BYTES // 1024 // 1024} MB")
+        try:
+            async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
+                async with client.stream("GET", url, headers=headers) as response:
+                    response.raise_for_status()
 
-            with path.open("wb") as file:
-                async for chunk in response.aiter_bytes(chunk_size=1024 * 256):
-                    downloaded += len(chunk)
-                    if downloaded > MAX_UPLOAD_BYTES:
+                    content_length = response.headers.get("content-length")
+                    if content_length and int(content_length) > MAX_UPLOAD_BYTES:
                         raise ValueError(f"File is larger than {MAX_UPLOAD_BYTES // 1024 // 1024} MB")
-                    file.write(chunk)
+
+                    with path.open("wb") as file:
+                        async for chunk in response.aiter_bytes(chunk_size=1024 * 256):
+                            downloaded += len(chunk)
+                            if downloaded > MAX_UPLOAD_BYTES:
+                                raise ValueError(f"File is larger than {MAX_UPLOAD_BYTES // 1024 // 1024} MB")
+                            file.write(chunk)
+            return
+        except ValueError:
+            path.unlink(missing_ok=True)
+            raise
+        except Exception as exc:
+            last_error = exc
+            path.unlink(missing_ok=True)
+            if attempt == RETRY_ATTEMPTS - 1:
+                break
+            logger.warning("Retrying media download after error: %s", exc)
+            await wait_before_retry(attempt + 1)
+
+    raise RuntimeError("Could not download media URL") from last_error
 
 
 def clean_url(url: str) -> str:
@@ -152,7 +191,7 @@ def extract_reels_url_from_message(message: Message) -> str | None:
         if entity.type == MessageEntity.TEXT_LINK and entity.url:
             candidate = entity.url
         elif entity.type == MessageEntity.URL:
-            candidate = entity.extract_from(source_text)
+            candidate = source_text[entity.offset : entity.offset + entity.length]
 
         if candidate:
             url = first_reels_url(candidate)
@@ -264,28 +303,73 @@ async def send_media(update: Update, media_items: list[MediaItem]) -> None:
         try:
             with tempfile.TemporaryDirectory(prefix="reels_downloader_") as temp_dir:
                 file_path = await download_media_file(item, Path(temp_dir))
-
-                if item.kind == "video":
-                    await update.message.chat.send_action(ChatAction.UPLOAD_VIDEO)
-                    with file_path.open("rb") as video:
-                        await update.message.reply_video(video=video)
-                elif item.kind == "photo":
-                    await update.message.chat.send_action(ChatAction.UPLOAD_PHOTO)
-                    with file_path.open("rb") as photo:
-                        await update.message.reply_photo(photo=photo)
-                else:
-                    await update.message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
-                    with file_path.open("rb") as document:
-                        await update.message.reply_document(document=document)
-        except Exception:
-            logger.exception("Could not send %s as a downloaded file", item.kind)
+                await upload_media_file(update, item.kind, file_path)
+        except Exception as exc:
+            logger.warning("Could not send %s as a downloaded file: %s", item.kind, exc)
+            if item.kind == "video" and await send_video_as_document(update, item):
+                continue
             if is_group_chat(update):
                 continue
             escaped_url = html.escape(item.proxy_url)
-            await update.message.reply_text(
-                f"Не смог отправить файлом. Возможно, ролик слишком большой или CDN временно не отдает файл.\n{escaped_url}",
-                disable_web_page_preview=True,
-            )
+            try:
+                await update.message.reply_text(
+                    f"Не смог отправить файлом. Возможно, ролик слишком большой или CDN временно не отдает файл.\n{escaped_url}",
+                    disable_web_page_preview=True,
+                )
+            except Exception as fallback_exc:
+                logger.warning("Could not send fallback message: %s", fallback_exc)
+
+
+async def upload_media_file(update: Update, kind: str, file_path: Path) -> None:
+    assert update.message is not None
+
+    last_error: Exception | None = None
+    for attempt in range(RETRY_ATTEMPTS):
+        try:
+            if kind == "video":
+                await update.message.chat.send_action(ChatAction.UPLOAD_VIDEO)
+                with file_path.open("rb") as video:
+                    await update.message.reply_video(video=video, read_timeout=180, write_timeout=180)
+            elif kind == "photo":
+                await update.message.chat.send_action(ChatAction.UPLOAD_PHOTO)
+                with file_path.open("rb") as photo:
+                    await update.message.reply_photo(photo=photo, read_timeout=120, write_timeout=120)
+            else:
+                await update.message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
+                with file_path.open("rb") as document:
+                    await update.message.reply_document(document=document, read_timeout=180, write_timeout=180)
+            return
+        except Exception as exc:
+            last_error = exc
+            if attempt == RETRY_ATTEMPTS - 1:
+                break
+            logger.warning("Retrying Telegram upload after error: %s", exc)
+            await wait_before_retry(attempt + 1)
+
+    raise RuntimeError("Could not upload media file to Telegram") from last_error
+
+
+async def send_video_as_document(update: Update, item: MediaItem) -> bool:
+    if not update.message:
+        return False
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="reels_downloader_doc_") as temp_dir:
+            file_path = await download_media_file(item, Path(temp_dir))
+            await upload_media_file(update, "document", file_path)
+        return True
+    except Exception as exc:
+        logger.warning("Could not send video as document: %s", exc)
+        return False
+
+
+async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    del update
+    error = context.error
+    if error:
+        logger.warning("Unhandled bot error: %s", error, exc_info=(type(error), error, error.__traceback__))
+    else:
+        logger.warning("Unhandled bot error")
 
 
 async def post_init(application: Application) -> None:
@@ -307,6 +391,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(MessageHandler((filters.TEXT | filters.Caption()) & ~filters.COMMAND, handle_message))
+    app.add_error_handler(handle_error)
     return app
 
 
