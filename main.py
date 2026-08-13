@@ -16,6 +16,7 @@ from Crypto.Cipher import AES
 from dotenv import load_dotenv
 from telegram import Message, MessageEntity, Update
 from telegram.constants import ChatAction
+from telegram.error import NetworkError, TimedOut
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 
@@ -41,6 +42,12 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
+
+
+def describe_error(error: Exception | None) -> str:
+    if error is None:
+        return "unknown error"
+    return str(error) or error.__class__.__name__
 
 
 async def wait_before_retry(attempt: int) -> None:
@@ -95,10 +102,10 @@ async def fetch_media(url: str) -> dict[str, Any]:
             last_error = exc
             if attempt == RETRY_ATTEMPTS - 1:
                 break
-            logger.warning("Retrying media API request after error: %s", exc)
+            logger.warning("Retrying media API request after error: %s", describe_error(exc))
             await wait_before_retry(attempt + 1)
 
-    raise RuntimeError("Could not fetch media data") from last_error
+    raise RuntimeError(f"Could not fetch media data: {describe_error(last_error)}") from last_error
 
 
 async def download_media_file(item: MediaItem, directory: Path) -> Path:
@@ -117,9 +124,9 @@ async def download_media_file(item: MediaItem, directory: Path) -> Path:
             return path
         except Exception as exc:
             last_error = exc
-            logger.warning("Failed to download %s media from %s: %s", item.kind, url, exc)
+            logger.warning("Failed to download %s media from %s: %s", item.kind, url, describe_error(exc))
 
-    raise RuntimeError("Could not download media file") from last_error
+    raise RuntimeError(f"Could not download media file: {describe_error(last_error)}") from last_error
 
 
 async def download_url(url: str, path: Path) -> None:
@@ -157,10 +164,10 @@ async def download_url(url: str, path: Path) -> None:
             path.unlink(missing_ok=True)
             if attempt == RETRY_ATTEMPTS - 1:
                 break
-            logger.warning("Retrying media download after error: %s", exc)
+            logger.warning("Retrying media download after error: %s", describe_error(exc))
             await wait_before_retry(attempt + 1)
 
-    raise RuntimeError("Could not download media URL") from last_error
+    raise RuntimeError(f"Could not download media URL: {describe_error(last_error)}") from last_error
 
 
 def clean_url(url: str) -> str:
@@ -215,6 +222,13 @@ def extract_media(data: Any) -> list[MediaItem]:
         seen.add(url)
         items.append(MediaItem(kind=kind, url=url, thumbnail=thumbnail))
 
+    def add_url_value(value: Any, default_kind: str, thumbnail: str | None = None) -> None:
+        if isinstance(value, str) and value.startswith("http"):
+            add(default_kind if default_kind else kind_from_url(value), value, thumbnail)
+        elif isinstance(value, list):
+            for item in value:
+                add_url_value(item, default_kind, thumbnail)
+
     def walk(value: Any) -> None:
         if isinstance(value, list):
             for item in value:
@@ -226,21 +240,31 @@ def extract_media(data: Any) -> list[MediaItem]:
 
         video = value.get("video")
         image = value.get("image") or value.get("photo")
+        media = value.get("media")
+        original = value.get("original")
         audio = value.get("audio") or value.get("mp3")
         thumbnail = value.get("thumbnail")
 
-        if isinstance(video, str) and video.startswith("http"):
-            add("video", video, thumbnail if isinstance(thumbnail, str) else None)
-        if isinstance(image, str) and image.startswith("http"):
-            add("photo", image)
-        if isinstance(audio, str) and audio.startswith("http"):
-            add("audio", audio)
+        add_url_value(video, "video", thumbnail if isinstance(thumbnail, str) else None)
+        add_url_value(media, "", thumbnail if isinstance(thumbnail, str) else None)
+        add_url_value(original, "", thumbnail if isinstance(thumbnail, str) else None)
+        add_url_value(image, "photo")
+        add_url_value(audio, "audio")
 
         for child in value.values():
             walk(child)
 
     walk(data)
     return items
+
+
+def kind_from_url(url: str) -> str:
+    path = url.split("?", 1)[0].lower()
+    if path.endswith((".jpg", ".jpeg", ".png", ".webp")):
+        return "photo"
+    if path.endswith((".mp3", ".m4a", ".aac", ".ogg")):
+        return "audio"
+    return "video"
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -279,8 +303,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     try:
         data = await fetch_media(url)
         media_items = extract_media(data)
-    except Exception:
-        logger.exception("Failed to fetch media for %s", url)
+    except Exception as exc:
+        logger.warning("Failed to fetch media for %s: %s", url, exc)
         if not is_group_chat(update):
             await update.message.reply_text(
                 "Не получилось получить медиа. Частые причины: приватный аккаунт, удаленный ролик или временная ошибка API."
@@ -366,7 +390,9 @@ async def send_video_as_document(update: Update, item: MediaItem) -> bool:
 async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     del update
     error = context.error
-    if error:
+    if isinstance(error, (NetworkError, TimedOut)):
+        logger.warning("Telegram network error, polling will retry: %s", error)
+    elif error:
         logger.warning("Unhandled bot error: %s", error, exc_info=(type(error), error, error.__traceback__))
     else:
         logger.warning("Unhandled bot error")
@@ -397,7 +423,14 @@ def build_app() -> Application:
 
 def main() -> None:
     app = build_app()
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        bootstrap_retries=-1,
+        connect_timeout=30,
+        read_timeout=30,
+        write_timeout=30,
+        pool_timeout=30,
+    )
 
 
 if __name__ == "__main__":
